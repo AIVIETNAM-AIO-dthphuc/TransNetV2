@@ -138,7 +138,13 @@ class TransNetV2:
         single_predictions.append(single_frame_pred.reshape(-1))
         all_predictions.append(all_frames_pred.reshape(-1))
 
-    def predict_video(self, video_fn: str, batch_size: int = 32):
+    def predict_video(
+        self,
+        video_fn: str,
+        batch_size: int = 32,
+        frame_stride: int = 1,
+        frame_offset: int = 0
+    ):
         try:
             import ffmpeg
         except ModuleNotFoundError:
@@ -146,21 +152,45 @@ class TransNetV2:
                 "Install ffmpeg and ffmpeg-python before using predict_video."
             )
 
+        if frame_stride <= 0:
+            raise ValueError("frame_stride must be a positive integer.")
+
+        if frame_offset < 0 or frame_offset >= frame_stride:
+            raise ValueError("frame_offset must satisfy 0 <= frame_offset < frame_stride.")
+
         print("[TransNetV2] Extracting frames from {}".format(video_fn))
 
-        video_stream, err = (
-            ffmpeg
-            .input(video_fn)
-            .filter("scale", 48, 27, flags="bilinear")
-            .output(
-                "pipe:",
-                format="rawvideo",
-                pix_fmt="rgb24",
-                vcodec="rawvideo"
+        stream = ffmpeg.input(video_fn)
+
+        if frame_stride > 1:
+            # Keep frames whose original index n satisfies:
+            # (n - frame_offset) % frame_stride == 0
+            #
+            # For frame_stride=2, frame_offset=0:
+            # keep n = 0, 2, 4, 6, ...
+            select_expr = f"not(mod(n-{frame_offset}\\,{frame_stride}))"
+            stream = stream.filter("select", select_expr)
+
+        stream = stream.filter("scale", 48, 27, flags="bilinear")
+
+        try:
+            video_stream, err = (
+                stream
+                .output(
+                    "pipe:",
+                    format="rawvideo",
+                    pix_fmt="rgb24",
+                    vcodec="rawvideo",
+                    vsync="0"
+                )
+                .global_args("-v", "error", "-nostdin")
+                .run(capture_stdout=True, capture_stderr=True)
             )
-            .global_args("-v", "error", "-nostdin")
-            .run(capture_stdout=True, capture_stderr=True)
-        )
+        except ffmpeg.Error as exc:
+            error_message = exc.stderr.decode("utf-8", errors="ignore")
+            raise RuntimeError(
+                f"FFmpeg failed while processing {video_fn}:\n{error_message}"
+            ) from exc
 
         video = np.frombuffer(video_stream, np.uint8).reshape([-1, 27, 48, 3])
 
@@ -168,7 +198,7 @@ class TransNetV2:
             video,
             *self.predict_frames(video, batch_size=batch_size)
         )
-
+    
     @staticmethod
     def predictions_to_scenes(predictions: np.ndarray, threshold: float = 0.5):
         predictions = (predictions > threshold).astype(np.uint8)
