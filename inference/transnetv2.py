@@ -168,7 +168,7 @@ class TransNetV2:
             #
             # For frame_stride=2, frame_offset=0:
             # keep n = 0, 2, 4, 6, ...
-            select_expr = f"not(mod(n-{frame_offset}\\,{frame_stride}))"
+            select_expr = f"not(mod(n-{frame_offset},{frame_stride}))"
             stream = stream.filter("select", select_expr)
 
         stream = stream.filter("scale", 48, 27, flags="bilinear")
