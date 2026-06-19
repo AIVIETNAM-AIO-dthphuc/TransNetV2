@@ -14,78 +14,160 @@ class TransNetV2:
                 print(f"[TransNetV2] Using weights from {model_dir}.")
 
         self._input_size = (27, 48, 3)
+
         try:
             self._model = tf.saved_model.load(model_dir)
         except OSError as exc:
-            raise IOError(f"[TransNetV2] It seems that files in {model_dir} are corrupted or missing. "
-                          f"Re-download them manually and retry. For more info, see: "
-                          f"https://github.com/soCzech/TransNetV2/issues/1#issuecomment-647357796") from exc
+            raise IOError(
+                f"[TransNetV2] It seems that files in {model_dir} are corrupted or missing."
+            ) from exc
+
+        self._predict_fn = self._build_predict_fn()
+
+    def _build_predict_fn(self):
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(shape=[None, 100, 27, 48, 3], dtype=tf.uint8)
+            ]
+        )
+        def predict_fn(frames):
+            frames = tf.cast(frames, tf.float32)
+            logits, dict_ = self._model(frames)
+
+            single_frame_pred = tf.sigmoid(logits)
+            all_frames_pred = tf.sigmoid(dict_["many_hot"])
+
+            return single_frame_pred, all_frames_pred
+
+        return predict_fn
 
     def predict_raw(self, frames: np.ndarray):
         assert len(frames.shape) == 5 and frames.shape[2:] == self._input_size, \
             "[TransNetV2] Input shape must be [batch, frames, height, width, 3]."
-        frames = tf.cast(frames, tf.float32)
 
-        logits, dict_ = self._model(frames)
-        single_frame_pred = tf.sigmoid(logits)
-        all_frames_pred = tf.sigmoid(dict_["many_hot"])
+        if frames.dtype != np.uint8:
+            frames = frames.astype(np.uint8, copy=False)
 
-        return single_frame_pred, all_frames_pred
+        return self._predict_fn(frames)
 
-    def predict_frames(self, frames: np.ndarray):
+    def predict_frames(self, frames: np.ndarray, batch_size: int = 32, verbose: bool = True):
         assert len(frames.shape) == 4 and frames.shape[1:] == self._input_size, \
             "[TransNetV2] Input shape must be [frames, height, width, 3]."
 
-        def input_iterator():
-            # return windows of size 100 where the first/last 25 frames are from the previous/next batch
-            # the first and last window must be padded by copies of the first and last frame of the video
-            no_padded_frames_start = 25
-            no_padded_frames_end = 25 + 50 - (len(frames) % 50 if len(frames) % 50 != 0 else 50)  # 25 - 74
+        n_frames = len(frames)
 
-            start_frame = np.expand_dims(frames[0], 0)
-            end_frame = np.expand_dims(frames[-1], 0)
-            padded_inputs = np.concatenate(
-                [start_frame] * no_padded_frames_start + [frames] + [end_frame] * no_padded_frames_end, 0
+        no_padded_frames_start = 25
+        no_padded_frames_end = 25 + 50 - (n_frames % 50 if n_frames % 50 != 0 else 50)
+
+        start_frame = np.expand_dims(frames[0], 0)
+        end_frame = np.expand_dims(frames[-1], 0)
+
+        padded_inputs = np.concatenate(
+            [start_frame] * no_padded_frames_start
+            + [frames]
+            + [end_frame] * no_padded_frames_end,
+            axis=0
+        )
+
+        single_predictions = []
+        all_predictions = []
+
+        batch_windows = []
+        processed = 0
+
+        ptr = 0
+        while ptr + 100 <= len(padded_inputs):
+            window = padded_inputs[ptr:ptr + 100]
+            batch_windows.append(window)
+            ptr += 50
+
+            if len(batch_windows) == batch_size:
+                self._process_window_batch(
+                    batch_windows,
+                    single_predictions,
+                    all_predictions
+                )
+
+                processed += len(batch_windows) * 50
+                batch_windows = []
+
+                if verbose:
+                    print(
+                        "\r[TransNetV2] Processing video frames {}/{}".format(
+                            min(processed, n_frames), n_frames
+                        ),
+                        end=""
+                    )
+
+        if len(batch_windows) > 0:
+            self._process_window_batch(
+                batch_windows,
+                single_predictions,
+                all_predictions
             )
 
-            ptr = 0
-            while ptr + 100 <= len(padded_inputs):
-                out = padded_inputs[ptr:ptr + 100]
-                ptr += 50
-                yield out[np.newaxis]
+            processed += len(batch_windows) * 50
 
-        predictions = []
+            if verbose:
+                print(
+                    "\r[TransNetV2] Processing video frames {}/{}".format(
+                        min(processed, n_frames), n_frames
+                    ),
+                    end=""
+                )
 
-        for inp in input_iterator():
-            single_frame_pred, all_frames_pred = self.predict_raw(inp)
-            predictions.append((single_frame_pred.numpy()[0, 25:75, 0],
-                                all_frames_pred.numpy()[0, 25:75, 0]))
+        if verbose:
+            print("")
 
-            print("\r[TransNetV2] Processing video frames {}/{}".format(
-                min(len(predictions) * 50, len(frames)), len(frames)
-            ), end="")
-        print("")
+        single_frame_pred = np.concatenate(single_predictions, axis=0)
+        all_frames_pred = np.concatenate(all_predictions, axis=0)
 
-        single_frame_pred = np.concatenate([single_ for single_, all_ in predictions])
-        all_frames_pred = np.concatenate([all_ for single_, all_ in predictions])
+        return (
+            single_frame_pred[:n_frames],
+            all_frames_pred[:n_frames]
+        )
 
-        return single_frame_pred[:len(frames)], all_frames_pred[:len(frames)]  # remove extra padded frames
+    def _process_window_batch(self, batch_windows, single_predictions, all_predictions):
+        batch = np.stack(batch_windows, axis=0)
 
-    def predict_video(self, video_fn: str):
+        single_frame_pred, all_frames_pred = self.predict_raw(batch)
+
+        single_frame_pred = single_frame_pred.numpy()[:, 25:75, 0]
+        all_frames_pred = all_frames_pred.numpy()[:, 25:75, 0]
+
+        single_predictions.append(single_frame_pred.reshape(-1))
+        all_predictions.append(all_frames_pred.reshape(-1))
+
+    def predict_video(self, video_fn: str, batch_size: int = 32):
         try:
             import ffmpeg
         except ModuleNotFoundError:
-            raise ModuleNotFoundError("For `predict_video` function `ffmpeg` needs to be installed in order to extract "
-                                      "individual frames from video file. Install `ffmpeg` command line tool and then "
-                                      "install python wrapper by `pip install ffmpeg-python`.")
+            raise ModuleNotFoundError(
+                "Install ffmpeg and ffmpeg-python before using predict_video."
+            )
 
         print("[TransNetV2] Extracting frames from {}".format(video_fn))
-        video_stream, err = ffmpeg.input(video_fn).output(
-            "pipe:", format="rawvideo", pix_fmt="rgb24", s="48x27"
-        ).run(capture_stdout=True, capture_stderr=True)
+
+        video_stream, err = (
+            ffmpeg
+            .input(video_fn)
+            .filter("scale", 48, 27, flags="bilinear")
+            .output(
+                "pipe:",
+                format="rawvideo",
+                pix_fmt="rgb24",
+                vcodec="rawvideo"
+            )
+            .global_args("-v", "error", "-nostdin")
+            .run(capture_stdout=True, capture_stderr=True)
+        )
 
         video = np.frombuffer(video_stream, np.uint8).reshape([-1, 27, 48, 3])
-        return (video, *self.predict_frames(video))
+
+        return (
+            video,
+            *self.predict_frames(video, batch_size=batch_size)
+        )
 
     @staticmethod
     def predictions_to_scenes(predictions: np.ndarray, threshold: float = 0.5):
@@ -156,38 +238,62 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("files", type=str, nargs="+", help="path to video files to process")
-    parser.add_argument("--weights", type=str, default=None,
-                        help="path to TransNet V2 weights, tries to infer the location if not specified")
-    parser.add_argument('--visualize', action="store_true",
-                        help="save a png file with prediction visualization for each extracted video")
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help="path to TransNet V2 weights"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="batch size for TransNetV2 inference"
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="save a png file with prediction visualization for each extracted video"
+    )
+
     args = parser.parse_args()
 
     model = TransNetV2(args.weights)
+
     for file in args.files:
         if os.path.exists(file + ".predictions.txt") or os.path.exists(file + ".scenes.txt"):
-            print(f"[TransNetV2] {file}.predictions.txt or {file}.scenes.txt already exists. "
-                  f"Skipping video {file}.", file=sys.stderr)
+            print(
+                f"[TransNetV2] {file}.predictions.txt or {file}.scenes.txt already exists. "
+                f"Skipping video {file}.",
+                file=sys.stderr
+            )
             continue
 
-        video_frames, single_frame_predictions, all_frame_predictions = \
-            model.predict_video(file)
+        video_frames, single_preds, all_preds = model.predict_video(
+            file,
+            batch_size=args.batch_size
+        )
 
-        predictions = np.stack([single_frame_predictions, all_frame_predictions], 1)
+        predictions = np.stack([single_preds, all_preds], axis=1)
         np.savetxt(file + ".predictions.txt", predictions, fmt="%.6f")
 
-        scenes = model.predictions_to_scenes(single_frame_predictions)
+        scenes = model.predictions_to_scenes(single_preds)
         np.savetxt(file + ".scenes.txt", scenes, fmt="%d")
 
         if args.visualize:
             if os.path.exists(file + ".vis.png"):
-                print(f"[TransNetV2] {file}.vis.png already exists. "
-                      f"Skipping visualization of video {file}.", file=sys.stderr)
+                print(
+                    f"[TransNetV2] {file}.vis.png already exists. "
+                    f"Skipping visualization of video {file}.",
+                    file=sys.stderr
+                )
                 continue
 
             pil_image = model.visualize_predictions(
-                video_frames, predictions=(single_frame_predictions, all_frame_predictions))
+                video_frames,
+                predictions=(single_preds, all_preds)
+            )
             pil_image.save(file + ".vis.png")
-
 
 if __name__ == "__main__":
     main()
